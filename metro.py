@@ -18,12 +18,13 @@ load_dotenv()  # Load .env variables
 # logger.add("scrapper_metrobus_{time}.log", rotation="1 day", level="INFO")
 
 HEADLESS = True
-SCHEDULED = False
+SCHEDULED = True
 
 TESTING_URL: str = "https://incidentesmovilidad.cdmx.gob.mx/public/bandejaEstadoServicio.xhtml?idMedioTransporte=stc"
 
 locator_table_container = "//tbody[contains(.,'EstadoServicio')]"
 locator_table_rows = "//table/tbody/tr"
+locator_next_page_button = "//a[@aria-label='Página siguiente']"
 
 # Global variable to store previous scrape results
 previous_results = None
@@ -64,14 +65,15 @@ def perform_research():
 
         wdfn.wait_for_element(driver, locator_table_container)
 
-        # Dictionary to hold Metro data
-        results = wdfn.get_metro_values(driver, locator_table_rows)
+        # # Dictionary to hold Metro data
+        all_metro_data = wdfn.get_all_pages_metro_values(
+            driver,
+            locator_table_rows,
+            locator_next_page_button
+        )
 
-        for key, value in results.items():
-            logger.debug(f"Line: {key}")
-            logger.debug(f"  Estado: {value['estado']}")
-            logger.debug(f"  Estaciones Afectadas: {value['estaciones_afectadas']}")
-            logger.debug(f"  Info Adicional: {value['informacion_adicional']}")
+        for line_id, info in all_metro_data.items():
+            logger.info(f"Line: {line_id} - {info}")
 
     except Exception as e:
         logger.exception("Error during research: %s", e)
@@ -80,7 +82,7 @@ def perform_research():
     finally:
         driver.quit()
 
-    return results
+    return all_metro_data
 
 
 def send_notification(line_number, line_data):
@@ -106,10 +108,10 @@ def send_notification(line_number, line_data):
     logger.debug(f"Notify PORT: {ntfy_port}")
 
     try:
-        topic = f"metrobus_linea_{line_number}"
+        topic = f"metro_linea_{line_number}"
         ntfy_url = f"http://{ntfy_ip}:{ntfy_port}/{topic}"
         logger.debug(f"Notify URL: {ntfy_url}")
-        headers = {'Title': f'Metrobus Linea {line_number}'}
+        headers = {'Title': f'Metro Linea {line_number}'}
         message = (
             f"Estado: {line_data.get('estado', 'N/A')}\n"
             f"Información adicional: {line_data.get('info_adicional', 'N/A')}\n"
@@ -127,12 +129,12 @@ def job():
     Function that combines checking the website and sending a message
     Checks if the current Mexico City time is between 5 AM and 11 PM.
     If so, performs the scraping and compares the new data with previous data.
-    For each metrobus line (1-7):
+    For each metro line:
       - On the first run, if the data does not match the happy path (i.e.,
         'estado' is not 'Servicio Regular', or 'info_adicional' is not empty, or
         'estaciones_afectadas' is not 'Ninguna'), a notification is sent.
       - On subsequent runs, if any field has changed, a notification is sent
-        to the corresponding topic (e.g., 'metrobus_linea_1').
+        to the corresponding topic (e.g., 'metro_linea_1').
     """
     try:
         # Set Mexico City timezone
@@ -148,39 +150,42 @@ def job():
 
         logger.info("Starting scraping job...")
         new_results = perform_research()
-        # global previous_results
-        #
-        # if previous_results is None:
-        #     # First run: send notification if the data is not the happy path.
-        #     for line in range(1, 8):
-        #         curr = new_results.get(line, {})
-        #         estado = curr.get('estado', '')
-        #         info_adicional = curr.get('info_adicional', '')
-        #         estaciones_afectadas = curr.get('estaciones_afectadas', '')
-        #         if estado != "Servicio Regular" or info_adicional.strip() != "" or estaciones_afectadas != "Ninguna":
-        #             try:
-        #                 send_notification(line, curr)
-        #             except Exception as e:
-        #                 logger.exception(f"Error sending initial notification for line {line}: {e}")
-        #         else:
-        #             logger.info(f"Initial happy path for line {line}. No notification sent.")
-        #     previous_results = new_results
-        #     logger.info("Initial scrape completed.")
-        # else:
-        #     # Subsequent runs: compare each line's values to previous values.
-        #     for line in range(1, 8):
-        #         prev = previous_results.get(line, {})
-        #         curr = new_results.get(line, {})
-        #         if (prev.get('estado') != curr.get('estado') or
-        #                 prev.get('estaciones_afectadas') != curr.get('estaciones_afectadas') or
-        #                 prev.get('info_adicional') != curr.get('info_adicional')):
-        #             try:
-        #                 send_notification(line, curr)
-        #             except Exception as e:
-        #                 logger.exception(f"Error sending notification for line {line}: {e}")
-        #         else:
-        #             logger.info(f"No changes detected for line {line}.")
-        #     previous_results = new_results
+        global previous_results
+
+        if previous_results is None:
+            # First run: send notification if the data is not the happy path.
+            for line_id, curr in new_results.items():
+                estado = curr.get('estado', '')
+                info_adicional = curr.get('informacion_adicional', '')
+                estaciones_afectadas = curr.get('estaciones_afectadas', '')
+
+                # Check if not in the “happy path”
+                if (estado != "Servicio Regular"
+                        or info_adicional.strip() != ""
+                        or estaciones_afectadas != "Ninguna"):
+                    try:
+                        send_notification(line_id, curr)
+                    except Exception as e:
+                        logger.exception(f"Error sending initial notification for line {line_id}: {e}")
+                else:
+                    logger.info(f"Initial happy path for line {line_id}. No notification sent.")
+
+            previous_results = new_results
+            logger.info("Initial scrape completed.")
+        else:
+            # Subsequent runs: compare each line's values to previous values.
+            for line_id, curr in new_results.items():
+                prev = previous_results.get(line_id, {})
+                if (prev.get('estado') != curr.get('estado') or
+                        prev.get('estaciones_afectadas') != curr.get('estaciones_afectadas') or
+                        prev.get('informacion_adicional') != curr.get('informacion_adicional')):
+                    try:
+                        send_notification(line_id, curr)
+                    except Exception as e:
+                        logger.exception(f"Error sending notification for line {line_id}: {e}")
+                else:
+                    logger.info(f"No changes detected for line {line_id}.")
+            previous_results = new_results
 
     except Exception as e:
         logger.exception("Error in job: %s", e)
